@@ -5,15 +5,16 @@ parser = argparse.ArgumentParser(description="Testing Reinforce Algorithm")
 parser.add_argument(
     "--env_name",
     type=str,
-    default="CartPole-v1",
+    default="CliffWalking-v0",
     help="Official name of the gymnasium environment to test the algorithm",
 )
-parser.add_argument("--gamma", type=float, help="forgetting factor", default=0.999)
+parser.add_argument("--gamma", type=float, help="forgetting factor", default=0.95)
 parser.add_argument("--episode_batch_number", type=int, help="Episode batch number", default=1)
-parser.add_argument("--Adam_lr", type=float, help="Initial adam optimizer learning rate", default=5e-12)
+parser.add_argument("--Adam_lr", type=float, help="Initial adam optimizer learning rate", default=2**-13)
 
 # %% importing all torch and gym related modules
 import numpy as np
+from time import time
 
 # torch related imports
 import torch
@@ -53,7 +54,7 @@ class parameterized_policy(nn.Module):
         x = net_input
         for i in range(len(self.Layers) - 1):
             x = self.Layers[i](x)
-            x = torch.tanh(x)
+            x = torch.relu(x)
         x = self.Layers[-1](x)
         out = torch.softmax(x, dim=1)
         return out
@@ -119,21 +120,18 @@ class REINFORCE:
             episode_length = len(self._Rlist)
             for t in range(episode_length):
                 forget_array = np.array([self.gamma ** (k - t - 1) for k in range(t + 1, episode_length + 1)])
-                modified_G = self.gamma**t * np.sum((R_array[t:] * forget_array))
-
-                self.A_list.append(self._Alist[t])
-                self.S_list.append(self._Slist[t])
-                self.G_list.append(modified_G)
-
+                G = np.sum((R_array[t:] * forget_array))
+                self.policy_net.train()
+                self.optimizer.zero_grad()
+                s_input = torch.tensor(self._Slist[t], dtype=torch.float).to(self.policy_net.device).view(1, -1)
+                probs = self.policy_net(s_input)
+                P_A_S = probs.squeeze()[self._Alist[t]]
+                loss = -(self.gamma**t) * G * torch.log(P_A_S)
+                loss.backward()
+                self.optimizer.step()
             self._delete_temp_lists()
-            self.episode_counter += 1
-            if self.episode_counter == self.K:
-                self._policy_update()
-                self._delete_main_lists()
-                self.episode_counter = 0
 
     def _policy_update(self):
-        self.policy_net.train()
         self.A_list = torch.tensor(self.A_list, dtype=torch.int64).to(self.policy_net.device)
         self.S_list = torch.tensor(self.S_list, dtype=torch.float32).to(self.policy_net.device)
         self.G_list = torch.tensor(self.G_list, dtype=torch.float32).to(self.policy_net.device)
@@ -158,15 +156,24 @@ writer = SummaryWriter()
 env = gym.make(args.env_name, render_mode="rgb_array")
 # env = RecordVideo(env, video_path, episode_trigger=lambda eps: eps % 50 == 0)
 env = RecordEpisodeStatistics(env)
-env = TransformReward(env, lambda r: r / 50)  # It is important to have normalized reward
-env = TransformObservation(env, lambda obs: obs / np.array([4.8, 1, 0.418, 1]))  # I had no idea how to set coefs for velocities
 
-obs_dim = env.unwrapped.observation_space.shape  # output is [4,]
+
+# env = TransformReward(env, lambda r: r / 50)  # It is important to have normalized reward
+# env = TransformObservation(env, lambda obs: obs / np.array([4.8, 1, 0.418, 1]))  # I had no idea how to set coefs for velocities
+def one_hotter(obs):
+    obs_n = env.unwrapped.observation_space.n
+    s = np.zeros((obs_n,))
+    s[obs] = 1
+    return s
+
+
+env = TransformObservation(env, one_hotter)  # I had no idea how to set coefs for velocities
+
+obs_dim = env.unwrapped.observation_space.n  # output is [4,]
 action_dim = env.unwrapped.action_space.n  # output is [1,]
-policy_net = parameterized_policy(obs_dim[0], [100, 4], action_dim)
-summary(policy_net, obs_dim)
+policy_net = parameterized_policy(obs_dim, [10, 10], action_dim)
+summary(policy_net, (obs_dim,))
 reinforce_agent = REINFORCE(args.episode_batch_number, policy_net, gamma=args.gamma, learning_rate=args.Adam_lr)
-
 for episode_iter in range(total_episode):
     observation, info = env.reset()
     reinforce_agent.episode_started(observation)
@@ -184,7 +191,7 @@ for episode_iter in range(total_episode):
     writer.add_scalar("training/return", episodic_retrun, global_step=episode_iter)
     writer.add_scalar("training/length", episodic_length, global_step=episode_iter)
     writer.add_scalar("training/sumreward", sumreward, global_step=episode_iter)
-
+    print(sumreward)
 
 env.close()
 writer.flush()
